@@ -39,6 +39,11 @@ from .skill_system import (
 )
 from .coding_mode_mixin import CodingModeMixin
 from .tool_guard_mixin import ToolGuardMixin
+from ..security.sandbox import (
+    DockerSandboxExecutor,
+    PathTranslator,
+    proxify_tool_dict,
+)
 from .tools import (
     browser_use,
     delegate_external_agent,
@@ -113,6 +118,7 @@ class QwenPawAgent(CodingModeMixin, ToolGuardMixin, ReActAgent):
         workspace_dir: Path | None = None,
         task_tracker: Any | None = None,
         plan_notebook: Any | None = None,
+        sandbox_provider: Any = None,
     ):
         """Initialize QwenPawAgent.
 
@@ -142,6 +148,24 @@ class QwenPawAgent(CodingModeMixin, ToolGuardMixin, ReActAgent):
         self._namesake_strategy = namesake_strategy
         self._workspace_dir = workspace_dir
         self._task_tracker = task_tracker
+        self._sandbox_provider = sandbox_provider
+        # Sandbox state — populated lazily on first reply() call.
+        # Set up here so other methods can probe self._sandbox_* safely.
+        self._sandbox_executor: DockerSandboxExecutor | None = None
+        self._sandbox_path_translator: PathTranslator | None = None
+        self._sandbox_enabled: bool = bool(
+            getattr(
+                getattr(agent_config, "security", None),
+                "sandbox",
+                None,
+            )
+            and getattr(
+                getattr(agent_config.security, "sandbox", None),
+                "enabled",
+                False,
+            ),
+        )
+        self._effective_skills: list[str] = []  # set below for toolkit rebuild
 
         # Extract configuration from agent_config
         running_config = agent_config.running
@@ -159,6 +183,11 @@ class QwenPawAgent(CodingModeMixin, ToolGuardMixin, ReActAgent):
             )
         except Exception:  # pylint: disable=broad-except
             effective_skills = []
+
+        # Cache for toolkit rebuild after sandbox starts (sandbox bring-up
+        # is async and happens on first reply(); toolkit must be rebuilt
+        # then with proxified tools).
+        self._effective_skills = list(effective_skills)
 
         # Initialize toolkit with built-in tools
         toolkit = self._create_toolkit(
@@ -334,6 +363,35 @@ class QwenPawAgent(CodingModeMixin, ToolGuardMixin, ReActAgent):
                         tool_name,
                     )
 
+        # If sandbox is already running, replace every tool with an HTTP
+        # proxy that forwards (name, arguments) to the sandbox container.
+        # The proxy preserves the original signature so agentscope's
+        # JSON-Schema generation still works. HOST_BOUND_TOOLS (browser,
+        # screenshot, etc.) stay local.
+        if (
+            self._sandbox_executor is not None
+            and self._sandbox_executor.started
+            and self._sandbox_path_translator is not None
+        ):
+            from ..security.sandbox import HOST_BOUND_TOOLS as _DEFAULT_HOST_BOUND
+            # Prefer config; fall back to module default for legacy configs.
+            _sandbox_cfg = getattr(self._agent_config.security, "sandbox", None)
+            _exclude = (
+                set(_sandbox_cfg.host_bound_tools)
+                if _sandbox_cfg is not None and getattr(_sandbox_cfg, "host_bound_tools", None)
+                else _DEFAULT_HOST_BOUND
+            )
+            tool_functions = proxify_tool_dict(
+                tool_functions,
+                transport=self._sandbox_executor.transport,
+                path_translator=self._sandbox_path_translator,
+                host_bound=frozenset(_exclude),
+            )
+            logger.info(
+                "Sandbox proxy active: %d tools routed to container",
+                len(tool_functions) - len(_exclude & set(tool_functions)),
+            )
+
         # Register tools with appropriate defaults
         for tool_name, tool_func in tool_functions.items():
             # For plugin tools: skip if not in config (security)
@@ -414,6 +472,145 @@ class QwenPawAgent(CodingModeMixin, ToolGuardMixin, ReActAgent):
             logger.warning(f"Failed to register Coding Mode tools: {e}")
 
         return toolkit
+
+    async def _ensure_sandbox_started(self) -> None:
+        """Lazily start the Docker sandbox and rebuild toolkit with proxies.
+
+        Called once on first reply(). If sandbox is disabled or already
+        started, this is a no-op. On failure the agent falls back to
+        local tool execution so a missing/broken sandbox never blocks the
+        user.
+        """
+        if not self._sandbox_enabled:
+            return
+        if self._sandbox_executor is not None and self._sandbox_executor.started:
+            return
+
+        try:
+            if self._sandbox_provider is not None:
+                # Workspace-level sandbox via SandboxManager: delegate
+                # lifecycle to the provider (AgentRunner.get_sandbox).
+                # Scope (session/agent/shared) is resolved inside the
+                # manager based on config.
+                _session_id = self._request_context.get("session_id", "")
+                result = await self._sandbox_provider(
+                    self._agent_config, _session_id,
+                )
+                if result is None:
+                    self._sandbox_enabled = False
+                    return
+                self._sandbox_executor, self._sandbox_path_translator = result
+            else:
+                # Per-agent sandbox (original behavior, backward-compatible).
+                sandbox_cfg = self._agent_config.security.sandbox
+                host_workspace = self._workspace_dir or WORKING_DIR
+                self._sandbox_executor = DockerSandboxExecutor(
+                    host_workspace=host_workspace,
+                    image=sandbox_cfg.image,
+                    memory_limit=sandbox_cfg.memory_limit,
+                    cpu_quota=sandbox_cfg.cpu_quota,
+                    network_enabled=sandbox_cfg.network_enabled,
+                    extra_volumes=dict(sandbox_cfg.extra_volumes) or None,
+                    env_vars=dict(sandbox_cfg.env_vars) or None,
+                    sandboxed_tools=sandbox_cfg.sandboxed_tools,
+                    ready_timeout_seconds=sandbox_cfg.ready_timeout_seconds,
+                )
+                ready_timeout = getattr(sandbox_cfg, "ready_timeout_seconds", 60)
+                await self._sandbox_executor.start(
+                    ready_timeout_seconds=ready_timeout,
+                )
+                self._sandbox_path_translator = PathTranslator(
+                    host_workspace=str(host_workspace),
+                    container_workspace=self._sandbox_executor.container_workspace,
+                )
+            logger.info(
+                "Sandbox started; rebuilding toolkit with HTTP proxies",
+            )
+
+            # Rebuild toolkit so every (non-host-bound) tool now points at
+            # the sandbox container. We replace self.toolkit wholesale; the
+            # parent ReActAgent reads tools off this attribute on each turn.
+            new_toolkit = self._create_toolkit(
+                namesake_strategy=self._namesake_strategy,
+                effective_skills=self._effective_skills,
+            )
+            self._register_skills(
+                new_toolkit,
+                effective_skills=self._effective_skills,
+            )
+            # Re-register memory tools (they were attached to the old toolkit)
+            if self.memory_manager is not None:
+                for tool_fn in self.memory_manager.list_memory_tools():
+                    new_toolkit.register_tool_function(
+                        tool_fn,
+                        namesake_strategy=self._namesake_strategy,
+                    )
+            self.toolkit = new_toolkit
+            logger.info("Toolkit rebuilt with sandbox proxies active")
+        except Exception as exc:  # pylint: disable=broad-except
+            # Strict mode: refuse to fall back to host execution.
+            # Reading the flag defensively so legacy configs without the
+            # `strict` field still work (defaults to False = old behavior).
+            sandbox_cfg = getattr(
+                getattr(self._agent_config, "security", None), "sandbox", None,
+            )
+            strict = bool(getattr(sandbox_cfg, "strict", False))
+
+            # Tear down whatever started before deciding what to raise/log.
+            # In shared-sandbox mode (provider), do NOT stop the container —
+            # its lifecycle is managed by the provider / workspace.
+            if self._sandbox_provider is None and self._sandbox_executor is not None:
+                try:
+                    await self._sandbox_executor.stop()
+                except Exception:  # pylint: disable=broad-except
+                    pass
+            self._sandbox_executor = None
+            self._sandbox_path_translator = None
+
+            if strict:
+                # Hard fail: do NOT silently degrade to host execution.
+                # Keep _sandbox_enabled True so a retry on the next reply()
+                # will attempt sandbox bring-up again rather than being
+                # permanently stuck in host-fallback mode.
+                logger.error(
+                    "Sandbox bring-up failed in STRICT mode (%s); "
+                    "refusing to fall back to host execution",
+                    exc,
+                )
+                raise RuntimeError(
+                    f"Sandbox is required (security.sandbox.strict=true) but "
+                    f"failed to start: {exc}. Tools will NOT run on the host. "
+                    f"Fix the sandbox (check Docker daemon, image, logs) or "
+                    f"set security.sandbox.strict=false to allow host fallback."
+                ) from exc
+
+            # Legacy / non-strict behavior: warn and fall back to host.
+            logger.warning(
+                "Sandbox bring-up failed (%s); falling back to local tools",
+                exc,
+            )
+            self._sandbox_enabled = False
+
+    async def aclose(self) -> None:
+        """Tear down sandbox resources held by this agent instance.
+
+        In per-agent mode (no provider), stops the container.
+        In shared-sandbox mode (provider), only clears local references —
+        the container is owned by the workspace and stopped on workspace
+        shutdown via AgentRunner.stop_sandbox().
+
+        Safe to call multiple times.
+        """
+        if self._sandbox_provider is None:
+            if self._sandbox_executor is not None and self._sandbox_executor.started:
+                try:
+                    await self._sandbox_executor.stop()
+                    logger.info("Sandbox container stopped")
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.warning("Sandbox stop failed: %s", exc)
+        # Always clear local refs (shared mode: just detach, don't stop)
+        self._sandbox_executor = None
+        self._sandbox_path_translator = None
 
     def _register_skills(
         self,
@@ -1459,6 +1656,11 @@ class QwenPawAgent(CodingModeMixin, ToolGuardMixin, ReActAgent):
         set_current_shell_command_executable(
             self._agent_config.running.shell_command_executable or None,
         )
+
+        # Bring up sandbox lazily on first reply() — must complete before
+        # any tool can be invoked. Fails open: if sandbox cannot start,
+        # tools fall back to local execution.
+        await self._ensure_sandbox_started()
 
         # Process file and media blocks in messages
         if msg is not None:

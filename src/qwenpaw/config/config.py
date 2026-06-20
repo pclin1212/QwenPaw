@@ -1776,6 +1776,106 @@ class SkillScannerConfig(BaseModel):
     )
 
 
+class SandboxConfig(BaseModel):
+    """Docker-based tool sandbox configuration.
+
+    When ``enabled=True``, ReAct agent starts a Docker container on first
+    ``reply()`` call and proxies all whitelisted tool calls into it via HTTP.
+    Tools listed in ``host_bound_tools`` always run on the host (e.g. browser,
+    screenshot, file delivery to user).
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable Docker tool sandbox. Requires Docker daemon running.",
+    )
+    strict: bool = Field(
+        default=False,
+        description=(
+            "Strict isolation mode. When True, a sandbox bring-up failure "
+            "(Docker missing, image not built, health check timeout, etc.) "
+            "raises RuntimeError and the agent refuses to serve the request "
+            "instead of silently falling back to host execution. "
+            "Recommended for production / untrusted-code workloads. "
+            "Has no effect when enabled=False."
+        ),
+    )
+    scope: str = Field(
+        default="agent",
+        description=(
+            "Sandbox container sharing scope. One of: "
+            "'session' -- one container per chat session (best isolation, "
+            "production / multi-user default); "
+            "'agent' -- one container per agent, shared across all sessions "
+            "(low overhead, preserves env state, single-dev default); "
+            "'shared' -- one global container for all agents and sessions "
+            "(minimal overhead, zero isolation, not for production). "
+            "Default 'agent' for backward compatibility."
+        ),
+    )
+    image: str = Field(
+        default="qwenpaw-sandbox:latest",
+        description="Sandbox container image. Build with `docker build -f docker/sandbox/Dockerfile`.",
+    )
+    memory_limit: Optional[str] = Field(
+        default=None,
+        description="Container memory limit, e.g. '2g', '512m'. None = no limit.",
+    )
+    cpu_quota: Optional[float] = Field(
+        default=None,
+        description="CPU quota in cores, e.g. 1.5 = 1.5 cores. None = no limit.",
+    )
+    network_enabled: bool = Field(
+        default=True,
+        description="Allow container network access. Set False for stricter isolation.",
+    )
+    extra_volumes: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Extra bind mounts: {host_path: container_path}.",
+    )
+    env_vars: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Extra environment variables passed into the container.",
+    )
+    sandboxed_tools: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Whitelist of tool names to proxy into sandbox. "
+            "None = all tools except host_bound_tools. "
+            "Useful for gradual rollout."
+        ),
+    )
+    host_bound_tools: List[str] = Field(
+        default_factory=lambda: [
+            "browser_use",
+            "desktop_screenshot",
+            "view_image",
+            "view_video",
+            "send_file_to_user",
+        ],
+        description="Tools that MUST run on host (UI/file-delivery tools).",
+    )
+    ready_timeout_seconds: int = Field(
+        default=60,
+        description="Max seconds to wait for container health check on startup.",
+    )
+    services_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable in-container service runner (supervisord mode). "
+            "Required for HTTP service adapters and MCP bridges."
+        ),
+    )
+    mcp_servers: Dict[str, Dict[str, Any]] = Field(
+        default_factory=dict,
+        description=(
+            "MCP servers to bridge inside sandbox. "
+            "Key=server name, value={command, args, env}. "
+            "Example: {'fs': {'command': 'npx', 'args': ['-y', '@modelcontextprotocol/server-filesystem', '/workspace']}}"
+        ),
+    )
+
+
 class SecurityConfig(BaseModel):
     """Top-level ``security`` section in config.json."""
 
@@ -1783,6 +1883,10 @@ class SecurityConfig(BaseModel):
     file_guard: FileGuardConfig = Field(default_factory=FileGuardConfig)
     skill_scanner: SkillScannerConfig = Field(
         default_factory=SkillScannerConfig,
+    )
+    sandbox: SandboxConfig = Field(
+        default_factory=SandboxConfig,
+        description="Docker tool sandbox configuration (security.sandbox).",
     )
     allow_no_auth_hosts: List[str] = Field(
         default_factory=lambda: ["127.0.0.1", "::1"],

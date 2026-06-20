@@ -464,6 +464,14 @@ class Workspace:
             f"Stopping agent instance: {self.agent_id} (final={final})",
         )
 
+        # Stop the shared sandbox container BEFORE stopping services, so the
+        # runner is still alive to manage the shutdown.
+        if self.runner is not None:
+            try:
+                await self.runner.stop_sandbox()
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("Failed to stop sandbox during shutdown: %s", exc)
+
         # Stop all services via ServiceManager (handles reuse automatically)
         await self._service_manager.stop_all(final=final)
 

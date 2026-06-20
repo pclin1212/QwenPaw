@@ -127,6 +127,58 @@ class AgentRunner(Runner):
         self.context_manager: BaseContextManager | None = None
         self._task_tracker = task_tracker  # Task tracker for background tasks
         self._agent_name: str | None = None
+        # SandboxManager handles all three scopes (session/agent/shared).
+        # Lazily initialized on first get_sandbox() call.
+        self._sandbox_mgr = None
+
+    async def get_sandbox(
+        self, agent_config: Any, session_id: str = "",
+    ) -> tuple | None:
+        """Get or create a sandbox container via SandboxManager.
+
+        Delegates to SandboxManager.acquire() which handles all three
+        scopes (session / agent / shared) based on config.
+
+        Returns (executor, path_translator) or None if sandbox is
+        disabled or failed in non-strict mode.  Raises RuntimeError
+        in strict mode.
+        """
+        sandbox_cfg = getattr(
+            getattr(agent_config, "security", None), "sandbox", None,
+        )
+        if not sandbox_cfg or not getattr(sandbox_cfg, "enabled", False):
+            return None
+
+        # Lazily create the SandboxManager with resolved workspace dir.
+        if self._sandbox_mgr is None:
+            from ...security.sandbox import SandboxManager
+            host_workspace = (
+                str(self.workspace_dir) if self.workspace_dir else None
+            )
+            if not host_workspace:
+                from ...constants import WORKING_DIR
+                host_workspace = str(WORKING_DIR)
+            self._sandbox_mgr = SandboxManager(
+                agent_id=self.agent_id,
+                workspace_dir=host_workspace,
+            )
+
+        scope = getattr(sandbox_cfg, "scope", "agent")
+        return await self._sandbox_mgr.acquire(
+            scope=scope,
+            session_id=session_id,
+            sandbox_cfg=sandbox_cfg,
+        )
+
+    async def release_session_sandbox(self, session_id: str) -> None:
+        """Release the sandbox for a specific session (scope='session')."""
+        if self._sandbox_mgr is not None:
+            await self._sandbox_mgr.release_session(session_id)
+
+    async def stop_sandbox(self) -> None:
+        """Stop ALL sandboxes owned by this runner."""
+        if self._sandbox_mgr is not None:
+            await self._sandbox_mgr.shutdown()
 
     @property
     def agent_name(self) -> str:
@@ -749,6 +801,7 @@ class AgentRunner(Runner):
                 workspace_dir=self.workspace_dir,
                 task_tracker=self._task_tracker,
                 plan_notebook=plan_notebook,
+                sandbox_provider=self.get_sandbox,
             )
             await agent.register_mcp_clients()
             agent.set_console_output_enabled(enabled=False)
