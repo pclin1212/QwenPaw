@@ -462,10 +462,11 @@ class ConsoleChannel(BaseChannel):
             if trailing := self._build_trailing_usage_sse(session_id):
                 yield trailing
 
+            from datetime import datetime as _sd_dt
+            _sd_ts = _sd_dt.now().isoformat(timespec="milliseconds")
             logger.info(
-                "console stream done: event_count=%s has_response=%s",
-                event_count,
-                last_response is not None,
+                "console stream done: ts=%s sid=%s event_count=%s has_response=%s",
+                _sd_ts, session_id, event_count, last_response is not None,
             )
 
             err_msg = self._get_response_error_message(last_response)

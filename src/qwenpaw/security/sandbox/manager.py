@@ -324,9 +324,11 @@ class SandboxManager:
             host_workspace=self.workspace_dir,
             container_workspace=executor.container_workspace,
         )
+        from datetime import datetime as _sb_dt
+        _sb_ts = _sb_dt.now().isoformat(timespec="milliseconds")
         logger.info(
-            "Sandbox started [%s] agent=%s: %s",
-            label, self.agent_id, executor.container_name,
+            "Sandbox started [%s] agent=%s: %s ts=%s",
+            label, self.agent_id, executor.container_name, _sb_ts,
         )
         return executor, translator
 

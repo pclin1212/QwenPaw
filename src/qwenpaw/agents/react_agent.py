@@ -486,6 +486,14 @@ class QwenPawAgent(CodingModeMixin, ToolGuardMixin, ReActAgent):
         if self._sandbox_executor is not None and self._sandbox_executor.started:
             return
 
+        from datetime import datetime as _sas_dt
+        _sas_sid = self._request_context.get("session_id") or "-"
+        _sas_ts = _sas_dt.now().isoformat(timespec="milliseconds")
+        logger.info(
+            "[sandbox-acquire-start] ts=%s sid=%s",
+            _sas_ts, _sas_sid,
+        )
+
         try:
             if self._sandbox_provider is not None:
                 # Workspace-level sandbox via SandboxManager: delegate
@@ -523,8 +531,12 @@ class QwenPawAgent(CodingModeMixin, ToolGuardMixin, ReActAgent):
                     host_workspace=str(host_workspace),
                     container_workspace=self._sandbox_executor.container_workspace,
                 )
+            from datetime import datetime as _sb_dt
+            _sb_sid = self._request_context.get("session_id") or "-"
+            _sb_ts = _sb_dt.now().isoformat(timespec="milliseconds")
             logger.info(
-                "Sandbox started; rebuilding toolkit with HTTP proxies",
+                "Sandbox started; rebuilding toolkit with HTTP proxies ts=%s sid=%s",
+                _sb_ts, _sb_sid,
             )
 
             # Rebuild toolkit so every (non-host-bound) tool now points at
@@ -1030,7 +1042,20 @@ class QwenPawAgent(CodingModeMixin, ToolGuardMixin, ReActAgent):
                         langfuse_span.update(output={"blocked": err})
                     return None
 
+            import time as _time
+            from datetime import datetime as _datetime
+            _t0 = _time.perf_counter()
             result = await super()._acting(tool_call)
+            _elapsed_ms = (_time.perf_counter() - _t0) * 1000
+            _sid = self._request_context.get("session_id") or "-"
+            _ts = _datetime.now().isoformat(timespec="milliseconds")
+            logger.info(
+                "[tool-timing] ts=%s %s elapsed=%.1fms sid=%s",
+                _ts,
+                tool_name,
+                _elapsed_ms,
+                _sid,
+            )
 
             if langfuse_span is not None:
                 langfuse_span.update(output=result)
@@ -1239,6 +1264,27 @@ class QwenPawAgent(CodingModeMixin, ToolGuardMixin, ReActAgent):
         Calls ``super()._reasoning`` to keep the ToolGuardMixin
         interception active.
         """
+        import time as _time
+        from datetime import datetime as _datetime
+        _t0_reasoning = _time.perf_counter()
+        try:
+            return await self._reasoning_inner(tool_choice)
+        finally:
+            _elapsed_ms = (_time.perf_counter() - _t0_reasoning) * 1000
+            _sid = self._request_context.get("session_id") or "-"
+            _ts = _datetime.now().isoformat(timespec="milliseconds")
+            logger.info(
+                "[llm-timing] ts=%s reasoning elapsed=%.1fms sid=%s",
+                _ts,
+                _elapsed_ms,
+                _sid,
+            )
+
+    async def _reasoning_inner(
+        self,
+        tool_choice: Literal["auto", "none", "required"] | None = None,
+    ) -> Msg:
+        """Inner reasoning logic (called by _reasoning with timing wrapper)."""
         nb = getattr(self, "plan_notebook", None)
         if nb is not None and getattr(
             nb,

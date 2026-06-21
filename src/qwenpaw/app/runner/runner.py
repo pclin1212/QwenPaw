@@ -494,8 +494,12 @@ class AgentRunner(Runner):
             set_current_user_id(user_id)
             set_current_channel(channel)
 
+            from datetime import datetime as _rq_dt
+            _rq_ts = _rq_dt.now().isoformat(timespec="milliseconds")
             logger.info(
-                "Handle agent query:\n%s",
+                "Handle agent query: ts=%s sid=%s\n%s",
+                _rq_ts,
+                session_id,
                 json.dumps(
                     {
                         "session_id": session_id,
