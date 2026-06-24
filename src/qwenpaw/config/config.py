@@ -1777,102 +1777,57 @@ class SkillScannerConfig(BaseModel):
 
 
 class SandboxConfig(BaseModel):
-    """Docker-based tool sandbox configuration.
+    """External sandbox service configuration (minimal).
 
-    When ``enabled=True``, ReAct agent starts a Docker container on first
-    ``reply()`` call and proxies all whitelisted tool calls into it via HTTP.
-    Tools listed in ``host_bound_tools`` always run on the host (e.g. browser,
-    screenshot, file delivery to user).
+    QwenPaw is a pure HTTP client of an externally-launched sandbox.
+    The container is started independently via docker compose under
+    ``docker/sandbox-standalone/``. See ``docs/sandbox.md``.
+
+    Only two knobs are surfaced to the user:
+
+      * ``enabled`` -- master switch. When True, every non-host-bound tool
+        is transparently rewritten into an HTTP proxy on first ``reply()``.
+        Host-bound tools (browser, screenshot, file delivery, multi-agent
+        IPC) are hard-coded in ``security.sandbox.HOST_BOUND_TOOLS`` and
+        always execute in-process.
+      * ``endpoint`` -- where to find the sandbox. Default works for the
+        out-of-the-box compose stack. Override only when the sandbox runs
+        on a different host or port (e.g. when the agent itself is
+        containerised and shares a docker network with the sandbox).
+
+    Timeouts, the workspace mapping, and the tool whitelist are no longer
+    user-facing knobs -- they were a maintenance burden with no real
+    operational value. Timeouts live as module constants in
+    ``security.sandbox.__init__``; the workspace path is derived from the
+    runner's ``workspace_dir``; the host-bound tool list is a code
+    constant.
+
+    Behaviour when ``enabled=True`` and the endpoint is unreachable:
+    ``SandboxUnavailableError`` is raised. There is no silent fallback --
+    if you ask for a sandbox you get one, or the request fails.
     """
+
+    # `extra='ignore'` is critical: legacy configs ship now-removed fields
+    # (image, memory_limit, cpu_quota, network_enabled, extra_volumes,
+    # env_vars, ready_timeout_seconds, services_enabled, mcp_servers,
+    # scope, strict, connect_timeout, call_timeout, startup_probe_timeout,
+    # workspace_root, sandboxed_tools, host_bound_tools) and must keep
+    # loading without raising ValidationError.
+    model_config = ConfigDict(extra="ignore")
 
     enabled: bool = Field(
         default=False,
-        description="Enable Docker tool sandbox. Requires Docker daemon running.",
+        description="Enable sandbox HTTP proxying. When True, the agent "
+                    "connects to the endpoint below and every non-host-"
+                    "bound tool runs inside the sandbox.",
     )
-    strict: bool = Field(
-        default=False,
-        description=(
-            "Strict isolation mode. When True, a sandbox bring-up failure "
-            "(Docker missing, image not built, health check timeout, etc.) "
-            "raises RuntimeError and the agent refuses to serve the request "
-            "instead of silently falling back to host execution. "
-            "Recommended for production / untrusted-code workloads. "
-            "Has no effect when enabled=False."
-        ),
-    )
-    scope: str = Field(
-        default="agent",
-        description=(
-            "Sandbox container sharing scope. One of: "
-            "'session' -- one container per chat session (best isolation, "
-            "production / multi-user default); "
-            "'agent' -- one container per agent, shared across all sessions "
-            "(low overhead, preserves env state, single-dev default); "
-            "'shared' -- one global container for all agents and sessions "
-            "(minimal overhead, zero isolation, not for production). "
-            "Default 'agent' for backward compatibility."
-        ),
-    )
-    image: str = Field(
-        default="qwenpaw-sandbox:latest",
-        description="Sandbox container image. Build with `docker build -f docker/sandbox/Dockerfile`.",
-    )
-    memory_limit: Optional[str] = Field(
-        default=None,
-        description="Container memory limit, e.g. '2g', '512m'. None = no limit.",
-    )
-    cpu_quota: Optional[float] = Field(
-        default=None,
-        description="CPU quota in cores, e.g. 1.5 = 1.5 cores. None = no limit.",
-    )
-    network_enabled: bool = Field(
-        default=True,
-        description="Allow container network access. Set False for stricter isolation.",
-    )
-    extra_volumes: Dict[str, str] = Field(
-        default_factory=dict,
-        description="Extra bind mounts: {host_path: container_path}.",
-    )
-    env_vars: Dict[str, str] = Field(
-        default_factory=dict,
-        description="Extra environment variables passed into the container.",
-    )
-    sandboxed_tools: Optional[List[str]] = Field(
-        default=None,
-        description=(
-            "Whitelist of tool names to proxy into sandbox. "
-            "None = all tools except host_bound_tools. "
-            "Useful for gradual rollout."
-        ),
-    )
-    host_bound_tools: List[str] = Field(
-        default_factory=lambda: [
-            "browser_use",
-            "desktop_screenshot",
-            "view_image",
-            "view_video",
-            "send_file_to_user",
-        ],
-        description="Tools that MUST run on host (UI/file-delivery tools).",
-    )
-    ready_timeout_seconds: int = Field(
-        default=60,
-        description="Max seconds to wait for container health check on startup.",
-    )
-    services_enabled: bool = Field(
-        default=False,
-        description=(
-            "Enable in-container service runner (supervisord mode). "
-            "Required for HTTP service adapters and MCP bridges."
-        ),
-    )
-    mcp_servers: Dict[str, Dict[str, Any]] = Field(
-        default_factory=dict,
-        description=(
-            "MCP servers to bridge inside sandbox. "
-            "Key=server name, value={command, args, env}. "
-            "Example: {'fs': {'command': 'npx', 'args': ['-y', '@modelcontextprotocol/server-filesystem', '/workspace']}}"
-        ),
+    endpoint: str = Field(
+        default="http://localhost:8765",
+        description="Sandbox service base URL. Start the service with "
+                    "`docker compose up -d` under docker/sandbox-"
+                    "standalone/. When the agent itself is containerised, "
+                    "use the sandbox container's docker network DNS name "
+                    "(e.g. http://qwenpaw-sandbox:8765).",
     )
 
 

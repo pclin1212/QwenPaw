@@ -127,21 +127,26 @@ class AgentRunner(Runner):
         self.context_manager: BaseContextManager | None = None
         self._task_tracker = task_tracker  # Task tracker for background tasks
         self._agent_name: str | None = None
-        # SandboxManager handles all three scopes (session/agent/shared).
-        # Lazily initialized on first get_sandbox() call.
-        self._sandbox_mgr = None
+        # External sandbox service is a pure HTTP client now.
+        # No per-runner state; build_sandbox_client() is called per reply.
+        # See docs/sandbox.md and docker/sandbox-standalone/.
 
     async def get_sandbox(
         self, agent_config: Any, session_id: str = "",
     ) -> tuple | None:
-        """Get or create a sandbox container via SandboxManager.
+        """Build an HTTP client for the externally-launched sandbox service.
 
-        Delegates to SandboxManager.acquire() which handles all three
-        scopes (session / agent / shared) based on config.
+        QwenPaw no longer owns the sandbox container lifecycle. This method
+        delegates to ``build_sandbox_client()`` which probes the configured
+        endpoint and returns a (client, path_translator) pair, or None when
+        sandbox is disabled / unreachable (non-strict).
 
-        Returns (executor, path_translator) or None if sandbox is
-        disabled or failed in non-strict mode.  Raises RuntimeError
-        in strict mode.
+        In strict mode, an unreachable endpoint raises
+        ``SandboxUnavailableError``.
+
+        ``session_id`` is unused here -- multi-tenant isolation is now a
+        deployment concern (run multiple sandbox-standalone stacks on
+        different ports). Kept in the signature for API stability.
         """
         sandbox_cfg = getattr(
             getattr(agent_config, "security", None), "sandbox", None,
@@ -149,36 +154,36 @@ class AgentRunner(Runner):
         if not sandbox_cfg or not getattr(sandbox_cfg, "enabled", False):
             return None
 
-        # Lazily create the SandboxManager with resolved workspace dir.
-        if self._sandbox_mgr is None:
-            from ...security.sandbox import SandboxManager
-            host_workspace = (
-                str(self.workspace_dir) if self.workspace_dir else None
-            )
-            if not host_workspace:
-                from ...constants import WORKING_DIR
-                host_workspace = str(WORKING_DIR)
-            self._sandbox_mgr = SandboxManager(
-                agent_id=self.agent_id,
-                workspace_dir=host_workspace,
-            )
+        from ...security.sandbox import build_sandbox_client
 
-        scope = getattr(sandbox_cfg, "scope", "agent")
-        return await self._sandbox_mgr.acquire(
-            scope=scope,
-            session_id=session_id,
+        host_workspace = (
+            str(self.workspace_dir) if self.workspace_dir else None
+        )
+        if not host_workspace:
+            from ...constants import WORKING_DIR
+            host_workspace = str(WORKING_DIR)
+
+        return await build_sandbox_client(
             sandbox_cfg=sandbox_cfg,
+            workspace_root=host_workspace,
         )
 
     async def release_session_sandbox(self, session_id: str) -> None:
-        """Release the sandbox for a specific session (scope='session')."""
-        if self._sandbox_mgr is not None:
-            await self._sandbox_mgr.release_session(session_id)
+        """No-op: the sandbox service is externally managed.
+
+        Kept for backward compatibility with callers (e.g. session cleanup
+        hooks). Lifecycle is now ``docker compose down`` on the operator
+        side.
+        """
+        return None
 
     async def stop_sandbox(self) -> None:
-        """Stop ALL sandboxes owned by this runner."""
-        if self._sandbox_mgr is not None:
-            await self._sandbox_mgr.shutdown()
+        """No-op: the sandbox service is externally managed.
+
+        Per-reply HTTP clients are closed by react_agent's own cleanup
+        path; the container itself outlives the runner.
+        """
+        return None
 
     @property
     def agent_name(self) -> str:

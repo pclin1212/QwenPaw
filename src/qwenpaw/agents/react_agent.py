@@ -40,7 +40,7 @@ from .skill_system import (
 from .coding_mode_mixin import CodingModeMixin
 from .tool_guard_mixin import ToolGuardMixin
 from ..security.sandbox import (
-    DockerSandboxExecutor,
+    SandboxClient,
     PathTranslator,
     proxify_tool_dict,
 )
@@ -151,7 +151,7 @@ class QwenPawAgent(CodingModeMixin, ToolGuardMixin, ReActAgent):
         self._sandbox_provider = sandbox_provider
         # Sandbox state — populated lazily on first reply() call.
         # Set up here so other methods can probe self._sandbox_* safely.
-        self._sandbox_executor: DockerSandboxExecutor | None = None
+        self._sandbox_executor: SandboxClient | None = None
         self._sandbox_path_translator: PathTranslator | None = None
         self._sandbox_enabled: bool = bool(
             getattr(
@@ -373,23 +373,16 @@ class QwenPawAgent(CodingModeMixin, ToolGuardMixin, ReActAgent):
             and self._sandbox_executor.started
             and self._sandbox_path_translator is not None
         ):
-            from ..security.sandbox import HOST_BOUND_TOOLS as _DEFAULT_HOST_BOUND
-            # Prefer config; fall back to module default for legacy configs.
-            _sandbox_cfg = getattr(self._agent_config.security, "sandbox", None)
-            _exclude = (
-                set(_sandbox_cfg.host_bound_tools)
-                if _sandbox_cfg is not None and getattr(_sandbox_cfg, "host_bound_tools", None)
-                else _DEFAULT_HOST_BOUND
-            )
+            from ..security.sandbox import HOST_BOUND_TOOLS
             tool_functions = proxify_tool_dict(
                 tool_functions,
                 transport=self._sandbox_executor.transport,
                 path_translator=self._sandbox_path_translator,
-                host_bound=frozenset(_exclude),
+                host_bound=HOST_BOUND_TOOLS,
             )
             logger.info(
                 "Sandbox proxy active: %d tools routed to container",
-                len(tool_functions) - len(_exclude & set(tool_functions)),
+                len(tool_functions) - len(HOST_BOUND_TOOLS & set(tool_functions)),
             )
 
         # Register tools with appropriate defaults
@@ -496,10 +489,10 @@ class QwenPawAgent(CodingModeMixin, ToolGuardMixin, ReActAgent):
 
         try:
             if self._sandbox_provider is not None:
-                # Workspace-level sandbox via SandboxManager: delegate
-                # lifecycle to the provider (AgentRunner.get_sandbox).
-                # Scope (session/agent/shared) is resolved inside the
-                # manager based on config.
+                # Provider-managed sandbox: delegate construction to the
+                # provider (AgentRunner.get_sandbox -> build_sandbox_client).
+                # Lifecycle of the underlying container is external to
+                # QwenPaw entirely.
                 _session_id = self._request_context.get("session_id", "")
                 result = await self._sandbox_provider(
                     self._agent_config, _session_id,
@@ -509,27 +502,21 @@ class QwenPawAgent(CodingModeMixin, ToolGuardMixin, ReActAgent):
                     return
                 self._sandbox_executor, self._sandbox_path_translator = result
             else:
-                # Per-agent sandbox (original behavior, backward-compatible).
+                # No external provider supplied -- build a per-agent HTTP
+                # client straight from config. The sandbox service itself
+                # is launched out-of-band (docker/sandbox-standalone/).
+                from ..security.sandbox import build_sandbox_client
                 sandbox_cfg = self._agent_config.security.sandbox
                 host_workspace = self._workspace_dir or WORKING_DIR
-                self._sandbox_executor = DockerSandboxExecutor(
-                    host_workspace=host_workspace,
-                    image=sandbox_cfg.image,
-                    memory_limit=sandbox_cfg.memory_limit,
-                    cpu_quota=sandbox_cfg.cpu_quota,
-                    network_enabled=sandbox_cfg.network_enabled,
-                    extra_volumes=dict(sandbox_cfg.extra_volumes) or None,
-                    env_vars=dict(sandbox_cfg.env_vars) or None,
-                    sandboxed_tools=sandbox_cfg.sandboxed_tools,
-                    ready_timeout_seconds=sandbox_cfg.ready_timeout_seconds,
+                fallback_result = await build_sandbox_client(
+                    sandbox_cfg=sandbox_cfg,
+                    workspace_root=str(host_workspace),
                 )
-                ready_timeout = getattr(sandbox_cfg, "ready_timeout_seconds", 60)
-                await self._sandbox_executor.start(
-                    ready_timeout_seconds=ready_timeout,
-                )
-                self._sandbox_path_translator = PathTranslator(
-                    host_workspace=str(host_workspace),
-                    container_workspace=self._sandbox_executor.container_workspace,
+                if fallback_result is None:
+                    self._sandbox_enabled = False
+                    return
+                self._sandbox_executor, self._sandbox_path_translator = (
+                    fallback_result
                 )
             from datetime import datetime as _sb_dt
             _sb_sid = self._request_context.get("session_id") or "-"
@@ -560,17 +547,14 @@ class QwenPawAgent(CodingModeMixin, ToolGuardMixin, ReActAgent):
             self.toolkit = new_toolkit
             logger.info("Toolkit rebuilt with sandbox proxies active")
         except Exception as exc:  # pylint: disable=broad-except
-            # Strict mode: refuse to fall back to host execution.
-            # Reading the flag defensively so legacy configs without the
-            # `strict` field still work (defaults to False = old behavior).
-            sandbox_cfg = getattr(
-                getattr(self._agent_config, "security", None), "sandbox", None,
-            )
-            strict = bool(getattr(sandbox_cfg, "strict", False))
-
-            # Tear down whatever started before deciding what to raise/log.
-            # In shared-sandbox mode (provider), do NOT stop the container —
-            # its lifecycle is managed by the provider / workspace.
+            # Sandbox bring-up failed. The new semantics are simple: if the
+            # user enabled the sandbox they get the sandbox or they get an
+            # error -- no silent fallback to host execution, because that
+            # would defeat the security guarantee they asked for.
+            #
+            # Tear down whatever partially started. In shared-sandbox mode
+            # (provider), do NOT stop the container -- its lifecycle is
+            # managed by the provider / workspace.
             if self._sandbox_provider is None and self._sandbox_executor is not None:
                 try:
                     await self._sandbox_executor.stop()
@@ -579,29 +563,19 @@ class QwenPawAgent(CodingModeMixin, ToolGuardMixin, ReActAgent):
             self._sandbox_executor = None
             self._sandbox_path_translator = None
 
-            if strict:
-                # Hard fail: do NOT silently degrade to host execution.
-                # Keep _sandbox_enabled True so a retry on the next reply()
-                # will attempt sandbox bring-up again rather than being
-                # permanently stuck in host-fallback mode.
-                logger.error(
-                    "Sandbox bring-up failed in STRICT mode (%s); "
-                    "refusing to fall back to host execution",
-                    exc,
-                )
-                raise RuntimeError(
-                    f"Sandbox is required (security.sandbox.strict=true) but "
-                    f"failed to start: {exc}. Tools will NOT run on the host. "
-                    f"Fix the sandbox (check Docker daemon, image, logs) or "
-                    f"set security.sandbox.strict=false to allow host fallback."
-                ) from exc
-
-            # Legacy / non-strict behavior: warn and fall back to host.
-            logger.warning(
-                "Sandbox bring-up failed (%s); falling back to local tools",
+            # Keep _sandbox_enabled True so the next reply() retries.
+            logger.error(
+                "Sandbox bring-up failed (%s); refusing to fall back to host. "
+                "Start the sandbox: `docker compose up -d` under "
+                "docker/sandbox-standalone/, or disable security.sandbox.enabled.",
                 exc,
             )
-            self._sandbox_enabled = False
+            raise RuntimeError(
+                f"Sandbox is enabled (security.sandbox.enabled=true) but "
+                f"failed to start: {exc}. Tools will NOT run on the host. "
+                f"Start the external sandbox (docker/sandbox-standalone/) "
+                f"or set security.sandbox.enabled=false to disable sandboxing."
+            ) from exc
 
     async def aclose(self) -> None:
         """Tear down sandbox resources held by this agent instance.
